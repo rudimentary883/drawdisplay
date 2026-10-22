@@ -1,8 +1,16 @@
 """
-Tabbycat Draw Viewer v1.0  (free Render web service)
+Tabbycat Draw Viewer v1.1  (free Render web service, public link)
 
-Shows the draw of one round like the tab site's big-screen draw page (venue, teams, adjudicators, auto-scroll, text size,
-hide adjudicators) with the SPEAKERS' NAMES under every team name.  READ-ONLY: it only reads from Tabbycat's API.
+Shows the released draw of a round in the look of the tab site's own draw page (OG/OO/CG/CO columns, team emojis, adjudicators
+with (C)/(T), Find in Table, text size, hide adjudicators, slow auto-scroll) with the SPEAKERS' NAMES under every team name.
+READ-ONLY: it only reads from Tabbycat's API.
+
+Set it up once on Render with environment variables (so the link can be opened by anyone, with nothing to type):
+  TAB_URL     https://ndc2026.calicotab.com        TAB_SLUG   ndc2026
+  TAB_TOKEN   (optional) admin token - needed if the tab keeps adjudicator names / pairings private; stays on the server
+  TEAM_NAME   code (default) | short | long | reference      TAB_TIMEZONE   Asia/Manila (default)
+  ALLOW_UNRELEASED   1 = also show draws that are not released yet (default: only released draws are shown)
+Without TAB_URL the page opens a small setup form, and the link can carry  ?url=...&slug=...  instead.
 
 Data it reads (GET only)
   /api/v1/tournaments/<slug>                       tournament name
@@ -13,11 +21,15 @@ Data it reads (GET only)
   /api/v1/tournaments/<slug>/venues                room names
 A released draw is public, so the token is optional for it; an admin token also shows an unreleased (draft/confirmed) draw.
 """
+import ipaddress
+import os
 import re
+import time
 from datetime import datetime
+from urllib.parse import urlencode, urlsplit
 
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request
 
 app = Flask(__name__)
 
@@ -162,8 +174,9 @@ NAME_FIELDS = {
     'reference': ('reference', 'long_name', 'short_name', 'code_name'),
 }
 BP_SIDES = ['og', 'oo', 'cg', 'co']
-SIDE_LABELS = {'og': 'Opening Government', 'oo': 'Opening Opposition', 'cg': 'Closing Government',
-               'co': 'Closing Opposition', 'aff': 'Affirmative', 'neg': 'Negative'}
+SIDE_LABELS = {'og': 'OG', 'oo': 'OO', 'cg': 'CG', 'co': 'CO', 'aff': 'Aff', 'neg': 'Neg'}
+CACHE_SECONDS = 30
+CACHE = {}
 
 
 def url_id(value):
@@ -186,7 +199,7 @@ def team_name(team, field):
     return f"Team {team.get('id', '?')}"
 
 
-def side_of(entry, position):
+def side_of(entry):
     """-> 'og' / 'oo' / 'cg' / 'co' / 'aff' / 'neg' / None for one entry of a pairing's teams list."""
     side = entry.get('side') if isinstance(entry, dict) else None
     if isinstance(side, str) and side.lower() in SIDE_LABELS:
@@ -212,18 +225,25 @@ def round_start_text(rnd, tz_name):
         return ''
 
 
-def build_draw(reader, round_text, name_field='code', tz_name='Asia/Manila'):
-    tournament = reader.get_json(reader.tournament_url())
-    rounds = reader.get_list(reader.tournament_url('/rounds'))
-    wanted = str(round_text).strip().lower()
-    rnd = next((r for r in rounds if str(r.get('seq')) == wanted), None) \
+def find_round(rounds, wanted):
+    wanted = str(wanted).strip().lower()
+    return next((r for r in rounds if str(r.get('seq')) == wanted), None) \
         or next((r for r in rounds if str(r.get('abbreviation', '')).lower() == wanted
                  or str(r.get('name', '')).lower() == wanted), None)
+
+
+def build_draw(reader, round_text, name_field='code', tz_name='Asia/Manila', allow_unreleased=False):
+    tournament = reader.get_json(reader.tournament_url())
+    rounds = reader.get_list(reader.tournament_url('/rounds'))
+    rnd = find_round(rounds, round_text)
     if rnd is None:
         raise ValueError(f"Round '{round_text}' not found. Rounds on this tab: "
                          + ', '.join(str(r.get('seq')) for r in rounds))
-    if rnd.get('draw_status') == 'N':
+    status = rnd.get('draw_status')
+    if status == 'N':
         raise ValueError(f"{rnd.get('name') or 'This round'} has no draw yet.")
+    if status != 'R' and not allow_unreleased:
+        raise ValueError(f"The draw for {rnd.get('name') or 'this round'} has not been released yet.")
     pairing_url = ((rnd.get('_links') or {}).get('pairing')) or (str(rnd.get('url', '')).rstrip('/') + '/pairings')
     pairings = reader.get_list(pairing_url)
 
@@ -242,7 +262,11 @@ def build_draw(reader, round_text, name_field='code', tz_name='Asia/Manila'):
         except ApiError:
             pass
 
-    adjs = {key_of(a): a.get('name', '') for a in reader.get_list(reader.tournament_url('/adjudicators'))}
+    adjs, adjs_hidden = {}, False
+    try:
+        adjs = {key_of(a): a.get('name', '') for a in reader.get_list(reader.tournament_url('/adjudicators'))}
+    except ApiError:
+        adjs_hidden = True                                              # the tab keeps adjudicators private (needs a token)
     venues = {}
     try:
         for v in reader.get_list(reader.tournament_url('/venues')):
@@ -254,15 +278,13 @@ def build_draw(reader, round_text, name_field='code', tz_name='Asia/Manila'):
         return (p.get('room_rank') if isinstance(p.get('room_rank'), (int, float)) else 10 ** 6,
                 -(p.get('bracket') or 0), p.get('id') or 0)
 
-    rows, layout = [], None
+    rows = []
     for p in sorted(pairings, key=sort_key):
         slots = []
-        entries = p.get('teams') or []
-        for position, entry in enumerate(entries):
-            side = side_of(entry, position)
+        for entry in (p.get('teams') or []):
             ref = entry.get('team') if isinstance(entry, dict) else entry
             team = teams.get(key_of(ref), {})
-            slots.append({'side': side, 'name': team_name(team, name_field) if team else '(unknown team)',
+            slots.append({'side': side_of(entry), 'name': team_name(team, name_field) if team else '(unknown team)',
                           'emoji': team.get('emoji') or '', 'speakers': speakers_by_team.get(key_of(ref), [])})
         adj = p.get('adjudicators') or {}
         if isinstance(adj, list):
@@ -275,42 +297,86 @@ def build_draw(reader, round_text, name_field='code', tz_name='Asia/Manila'):
             'trainees': [adjs.get(key_of(u), '') for u in (adj.get('trainees') or [])],
         })
 
-    # column headings: BP sides if the pairings say so (or 4 teams), otherwise the sides as given, in order
+    # column headings: OG/OO/CG/CO when the pairings say so (or 4 teams), otherwise Aff/Neg or Team 1, 2 ...
     sides = [s['side'] for r in rows[:1] for s in r['teams']]
     if rows and all(sides) and len(set(sides)) == len(sides):
         order = [x for x in BP_SIDES + ['aff', 'neg'] if x in sides]
-        for r in rows:                                   # put every debate's teams in the same column order
+        for r in rows:                                   # every debate's teams in the same column order
             r['teams'].sort(key=lambda s: order.index(s['side']) if s['side'] in order else 99)
         layout = [SIDE_LABELS[x] for x in order]
     else:
         count = max((len(r['teams']) for r in rows), default=0)
-        layout = ([SIDE_LABELS[x] for x in BP_SIDES] if count == 4 else
-                  ['Affirmative', 'Negative'] if count == 2 else [f"Team {i + 1}" for i in range(count)])
+        layout = (['OG', 'OO', 'CG', 'CO'] if count == 4 else ['Aff', 'Neg'] if count == 2
+                  else [f"Team {i + 1}" for i in range(count)])
     start = round_start_text(rnd, tz_name)
     round_name = rnd.get('name') or f"Round {rnd.get('seq')}"
+    shown = [{'seq': r.get('seq'), 'name': r.get('name') or f"Round {r.get('seq')}"} for r in rounds
+             if r.get('draw_status') == 'R' or (allow_unreleased and r.get('draw_status') not in (None, 'N'))]
     return {
         'tournament': tournament.get('name') or reader.slug,
         'round_name': round_name,
-        'banner': f"Draw for {round_name} debates start at {start}" if start else f"Draw for {round_name}",
-        'draw_status': rnd.get('draw_status'),
+        'round_seq': rnd.get('seq'),
+        'start': start,
         'positions': layout,
         'rows': rows,
+        'draw_rounds': shown,
+        'all_rounds': [{'seq': r.get('seq'), 'name': r.get('name') or f"Round {r.get('seq')}"} for r in rounds],
+        'adjs_hidden': adjs_hidden,
     }
 
 
 # =============================================================================
-# ROUTES
+# CONFIGURATION (environment variables, or ?url=...&slug=... in the link)
 # =============================================================================
 
-def reader_from_form(data):
-    return TabbycatReader(data.get('base_url', ''), data.get('token', ''), data.get('slug', ''),
-                          username=data.get('username') or None, password=data.get('password') or None)
+def safe_url(url):
+    """The viewer is public: only plain https tab sites by host name (no IP addresses / localhost) can be read."""
+    parts = urlsplit((url or '').strip())
+    host = (parts.hostname or '').lower()
+    if parts.scheme != 'https' or not host or host == 'localhost' or '.' not in host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        return True
 
 
-def load(data):
-    reader = reader_from_form(data)
-    return build_draw(reader, data.get('round') or '1', data.get('name_field') or 'code',
-                      (data.get('timezone') or 'Asia/Manila').strip())
+def get_config():
+    env_url, env_slug = os.environ.get('TAB_URL', '').strip(), os.environ.get('TAB_SLUG', '').strip()
+    locked = bool(env_url and env_slug)
+    q = request.args
+    cfg = {
+        'url': (env_url if locked else q.get('url', '')).strip().rstrip('/'),
+        'slug': (env_slug if locked else q.get('slug', '')).strip().strip('/'),
+        'name': (q.get('name') or os.environ.get('TEAM_NAME') or 'code').strip().lower(),
+        'tz': (q.get('tz') or os.environ.get('TAB_TIMEZONE') or 'Asia/Manila').strip(),
+        'token': os.environ.get('TAB_TOKEN', '').strip() if locked else '',
+        'allow_unreleased': os.environ.get('ALLOW_UNRELEASED', '') == '1',
+        'locked': locked,
+    }
+    cfg['ok'] = bool(cfg['url'] and cfg['slug'] and (locked or safe_url(cfg['url'])))
+    return cfg
+
+
+def query_string(cfg):
+    """Keep the link's own settings when moving between rounds (nothing when the server holds them)."""
+    if cfg['locked']:
+        return ''
+    return '?' + urlencode({'url': cfg['url'], 'slug': cfg['slug'], 'name': cfg['name'], 'tz': cfg['tz']})
+
+
+def load_draw(cfg, round_text):
+    key = (cfg['url'], cfg['slug'], str(round_text), cfg['name'], cfg['tz'], cfg['allow_unreleased'])
+    hit = CACHE.get(key)
+    if hit and time.time() - hit[0] < CACHE_SECONDS:
+        return hit[1]
+    reader = TabbycatReader(cfg['url'], cfg['token'], cfg['slug'])
+    draw = build_draw(reader, round_text, cfg['name'], cfg['tz'], cfg['allow_unreleased'])
+    CACHE[key] = (time.time(), draw)
+    if len(CACHE) > 60:
+        CACHE.pop(min(CACHE, key=lambda k: CACHE[k][0]), None)
+    return draw
 
 
 def explain(exc):
@@ -319,36 +385,50 @@ def explain(exc):
     return str(exc)
 
 
+# =============================================================================
+# ROUTES
+# =============================================================================
+
 @app.route('/')
 def index():
-    return render_template('index.html', error=None, f={})
-
-
-@app.route('/draw', methods=['POST'])
-def draw_page():
-    f = request.form
-    data = {'base_url': f.get('api_url', ''), 'token': f.get('api_token', ''), 'slug': f.get('tournament_slug', ''),
-            'username': f.get('api_username', ''), 'password': f.get('api_password', ''), 'round': f.get('round', '1'),
-            'name_field': f.get('name_field', 'code'), 'timezone': f.get('timezone', 'Asia/Manila')}
-    if not data['base_url'].strip() or not data['slug'].strip():
-        return render_template('index.html', error='Enter the Tabbycat URL and the tournament slug.', f=f)
+    cfg = get_config()
+    if not cfg['ok']:
+        error = 'That tab site address is not allowed (use its https:// address).' if request.args.get('url') else None
+        return render_template('index.html', error=error, f=request.args)
     try:
-        draw = load(data)
+        reader = TabbycatReader(cfg['url'], cfg['token'], cfg['slug'])
+        rounds = reader.get_list(reader.tournament_url('/rounds'))
     except Exception as exc:
-        return render_template('index.html', error=explain(exc), f=f)
-    show_speakers = f.get('show_speakers') == 'on'
-    return render_template('draw.html', draw=draw, creds=data, show_speakers=show_speakers,
-                           show_adjs=f.get('show_adjudicators') == 'on')
+        return render_template('index.html', error=explain(exc), f=request.args)
+    ok = [r for r in rounds if r.get('draw_status') == 'R' or (cfg['allow_unreleased'] and r.get('draw_status') not in (None, 'N'))]
+    if not ok:
+        return render_template('index.html', error='No draw has been released on this tab yet.', f=request.args)
+    latest = max(ok, key=lambda r: r.get('seq') or 0)
+    return redirect(f"/round/{latest.get('seq')}{query_string(cfg)}")
 
 
-@app.route('/data', methods=['POST'])
-def data_route():
+@app.route('/round/<round_text>')
+def draw_page(round_text):
+    cfg = get_config()
+    if not cfg['ok']:
+        return redirect('/')
     try:
-        return jsonify({'ok': True, 'draw': load(request.get_json(force=True) or {})})
+        draw = load_draw(cfg, round_text)
     except Exception as exc:
-        return jsonify({'ok': False, 'error': explain(exc)}), 200
+        return render_template('index.html', error=explain(exc), f=request.args), 200
+    return render_template('draw.html', draw=draw, qs=query_string(cfg), site=f"{cfg['url']}/{cfg['slug']}")
+
+
+@app.route('/data/<round_text>')
+def data_route(round_text):
+    cfg = get_config()
+    if not cfg['ok']:
+        return jsonify({'ok': False, 'error': 'Not configured.'})
+    try:
+        return jsonify({'ok': True, 'draw': load_draw(cfg, round_text)})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': explain(exc)})
 
 
 if __name__ == '__main__':
-    import os
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
