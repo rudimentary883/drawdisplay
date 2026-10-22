@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tabbycat Draw Viewer</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 760px; margin: 0 auto;
+               padding: 20px; background: #f5f5f5; line-height: 1.6; }
+        h1 { color: #333; margin-bottom: 5px; }
+        .subtitle { color: #666; font-size: 14px; margin-bottom: 25px; }
+        .card { background: #fff; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+        .card h2 { margin-top: 0; font-size: 18px; color: #444; border-bottom: 2px solid #e0e0e0; padding-bottom: 10px; }
+        label { display: block; font-weight: 600; margin: 15px 0 5px; color: #444; }
+        input[type=text], input[type=password], input[type=url], input[type=number], select { width: 100%; padding: 10px 12px;
+               border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+        .check { display: flex; gap: 8px; align-items: flex-start; font-weight: normal; margin: 10px 0 0; cursor: pointer; }
+        .check input { margin-top: 5px; }
+        .hint { font-size: 12px; color: #888; margin-top: 3px; }
+        .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        @media (max-width: 600px) { .two-col { grid-template-columns: 1fr; } }
+        .btn { background: #28a745; color: #fff; border: 0; padding: 14px 32px; border-radius: 6px; font-size: 16px; cursor: pointer; font-weight: 600; }
+        .btn:hover { background: #218838; }
+        .flash { padding: 12px 16px; border-radius: 6px; margin-bottom: 15px; background: #f8d7da; color: #721c24; }
+        summary { cursor: pointer; font-size: 13px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>Tabbycat Draw Viewer <span style="font-size:14px;color:#888;">v1.0</span></h1>
+    <p class="subtitle">Shows a round's draw like the tab site's draw page, with the speakers' names under each team. Read-only.</p>
+    {% if error %}<div class="flash">{{ error }}</div>{% endif %}
+    <form action="/draw" method="POST">
+        <div class="card">
+            <h2>1. Tabbycat API settings</h2>
+            <div class="two-col">
+                <div><label for="api_url">Tabbycat URL</label>
+                    <input type="url" name="api_url" id="api_url" value="{{ f.get('api_url', '') }}" placeholder="https://ndc2026.calicotab.com" required></div>
+                <div><label for="tournament_slug">Tournament slug</label>
+                    <input type="text" name="tournament_slug" id="tournament_slug" value="{{ f.get('tournament_slug', '') }}" placeholder="ndc2026" required></div>
+            </div>
+            <label for="api_token">API token (admin account)</label>
+            <input type="text" name="api_token" id="api_token" autocomplete="off">
+            <p class="hint">Optional for a draw that is already released (public). An admin token also shows a draw that is not released yet.</p>
+            <details><summary>Session login fallback (optional)</summary>
+                <div class="two-col">
+                    <div><label>Admin username</label><input type="text" name="api_username" value="{{ f.get('api_username', '') }}"></div>
+                    <div><label>Admin password</label><input type="password" name="api_password" autocomplete="off"></div>
+                </div>
+            </details>
+        </div>
+        <div class="card">
+            <h2>2. Draw options</h2>
+            <div class="two-col">
+                <div><label for="round">Round</label>
+                    <input type="text" name="round" id="round" value="{{ f.get('round', '1') }}" placeholder="2">
+                    <p class="hint">The round number (e.g. 2).</p></div>
+                <div><label for="name_field">Team name shown</label>
+                    <select name="name_field" id="name_field">
+                        {% for k, v in (('code', 'Code name (as in the tab configuration for now)'), ('short', 'Short name'), ('long', 'Full name'), ('reference', 'Reference only')) %}
+                        <option value="{{ k }}" {% if f.get('name_field', 'code') == k %}selected{% endif %}>{{ v }}</option>{% endfor %}
+                    </select></div>
+            </div>
+            <label for="timezone">Time zone for the start time</label>
+            <input type="text" name="timezone" id="timezone" value="{{ f.get('timezone', 'Asia/Manila') }}">
+            <p class="hint">A name such as Asia/Manila. Only used for the line "debates start at ...".</p>
+            <label class="check"><input type="checkbox" name="show_speakers" checked><span>Show the speakers' names under each team</span></label>
+            <label class="check"><input type="checkbox" name="show_adjudicators" checked><span>Show the adjudicators</span></label>
+        </div>
+        <div class="card" style="text-align:center;">
+            <button class="btn" type="submit">Show the draw</button>
+            <p class="hint">This tool only reads from Tabbycat and never changes your tab site.</p>
+        </div>
+    </form>
+</body>
+</html>
